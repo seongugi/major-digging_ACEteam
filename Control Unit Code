@@ -1,0 +1,262 @@
+#define F_CPU 16000000UL
+#define SCL_CLOCK 100000L
+
+#define SOIL_ADDRESS 0x20
+#define LIGHT_ADDRESS 0x28
+#define MY_ADDRESS 0x25
+#define TARGET_ADDRESS 0x21 
+
+#define FC 47.8f
+#define TRIGGER 37.87f        
+
+volatile unsigned long timer2_overflow_count = 61 * 14;
+unsigned long cycle_start_count = 0;
+volatile unsigned long current_count = 0;
+
+const unsigned long PWM_INTERVAL = 61 * 15;
+const unsigned long UPDATE_INTERVAL = 61 * 5;
+
+volatile uint8_t received_sender_id;     
+volatile bool expecting_sender_id = true; 
+
+volatile uint8_t is_night = 0;         
+
+volatile bool night_block = true;
+volatile bool soil_block = true;
+
+volatile float err = 0.0f;        
+volatile float pwm = 150.0f;  
+
+volatile uint16_t hum_data;
+volatile uint8_t light_data;
+
+void twi_slave_listen() {
+  unsigned char actual_data;
+    if (!(TWCR & (1 << TWINT))) {
+        return; 
+    }
+    
+    switch (TWSR & 0xF8) {
+        case 0x60:
+            expecting_sender_id = true; 
+            TWCR = (1 << TWINT) | (1 << TWEA) | (1 << TWEN);
+            break;
+
+        case 0x80:
+            if (expecting_sender_id) {
+                received_sender_id = TWDR;
+                expecting_sender_id = false;
+            } else {
+                actual_data = TWDR;
+                switch(received_sender_id){
+                  case 0x20:
+                    hum_data = actual_data;
+                    break;
+                  case 0x28:
+                    light_data = actual_data;
+                    break;
+                  default:
+                    break;
+                    }
+                TWCR = (1 << TWINT) | (1 << TWEA) | (1 << TWEN); 
+            }
+            break;
+
+        case 0xA0:
+            expecting_sender_id = true; 
+            TWCR = (1 << TWINT) | (1 << TWEA) | (1 << TWEN); 
+            break;
+            
+        default:
+            TWCR = (1 << TWINT) | (1 << TWEA) | (1 << TWEN);
+            break;
+    }
+}
+
+bool twi_master_transmit(unsigned char* data, uint8_t length) {
+    TWCR = (1 << TWINT) | (1 << TWSTA) | (1 << TWEN);
+    while (!(TWCR & (1 << TWINT)));
+    if ((TWSR & 0xF8) != 0x08) return false; 
+
+    TWDR = (TARGET_ADDRESS << 1) | 0;
+    TWCR = (1 << TWINT) | (1 << TWEN);
+    while (!(TWCR & (1 << TWINT)));
+
+    switch (TWSR & 0xF8) {
+        case 0x18: 
+            break; 
+        case 0x20:
+            TWCR = (1 << TWINT) | (1 << TWSTO) | (1 << TWEN); 
+            return false;
+        case 0x38: 
+            TWCR = (1 << TWINT) | (1 << TWEN);
+            return false;
+        default:
+            return false; 
+    }
+    
+    for (uint8_t i = 0; i < length; i++) {
+        TWDR = data[i];
+        TWCR = (1 << TWINT) | (1 << TWEN); 
+        while (!(TWCR & (1 << TWINT))); 
+
+        if ((TWSR & 0xF8) != 0x28) {
+            TWCR = (1 << TWINT) | (1 << TWSTO) | (1 << TWEN); 
+            return false;
+        }
+    }
+
+    TWCR = (1 << TWINT) | (1 << TWSTO) | (1 << TWEN);
+    return true; 
+}
+
+ISR(TIMER2_OVF_vect) {
+  timer2_overflow_count++;
+}
+
+void UART_init(unsigned int ubrr) {
+  UBRR0H = (unsigned char)(ubrr >> 8);
+  UBRR0L = (unsigned char)ubrr;
+  
+  UCSR0B = (1 << RXEN0) | (1 << TXEN0); 
+
+  UCSR0C = (1 << UCSZ01) | (1 << UCSZ00); 
+}
+
+void UART_transmit(unsigned char data) {
+  while (!(UCSR0A & (1 << UDRE0))); 
+  UDR0 = data; 
+}
+
+void send_number(float num) {
+  char buf[10];
+  dtostrf(num, 0, 2, buf);  
+  string_transmit(buf);
+}
+
+void send_hex(uint8_t num) {
+  char buf[10];
+  itoa(num, buf, 16); 
+  string_transmit(buf);
+}
+
+void string_transmit_ln(const char data []) {
+  for (int i = 0; data[i] != '\0'; i ++) {
+    UART_transmit(data[i]);
+  }
+  UART_transmit('\n'); 
+}
+
+void string_transmit(const char data []) {
+  for (int i = 0; data[i] != '\0'; i ++) {
+    UART_transmit(data[i]);
+  }
+}
+
+void setup(){
+  UART_init(103);
+
+  TCCR2A = 0; 
+  TCCR2B = (1 << CS22) | (1 << CS21) | (1 << CS20);
+  TIMSK2 |= (1 << TOIE2); 
+
+  PORTC |= (1 << PC4) | (1 << PC5);
+    
+  TWSR = 0x00;
+  TWBR = ((F_CPU / SCL_CLOCK) - 16) / 2;
+    
+  TWAR = (MY_ADDRESS << 1);
+    
+  TWCR = (1 << TWEN) | (1 << TWEA);
+
+  string_transmit("Node initialized. My address is 0x");
+  send_hex(MY_ADDRESS);
+  string_transmit("\n");
+  string_transmit_ln("----------------------------------");
+}
+
+void loop(){
+  twi_slave_listen();
+
+  unsigned long test_count;
+  unsigned char pwm2=pwm;
+
+  TIMSK2 &= ~(1 << TOIE2); 
+  current_count = timer2_overflow_count;
+  TIMSK2 |= (1 << TOIE2);
+
+  if(current_count - cycle_start_count >= PWM_INTERVAL){ 
+      cycle_start_count = current_count;
+      is_night = light_data;
+
+        if (is_night == 1) {
+          night_block = true;  
+          string_transmit_ln("Light : night");
+        }
+        else{
+          night_block = false;  
+          string_transmit_ln("Light : day");
+        }
+
+        string_transmit("Soil Humidity : ");
+        send_number(hum_data);
+        string_transmit("\n");
+    
+
+        if (hum_data > TRIGGER) {
+          soil_block = true;      
+          string_transmit_ln("too wet");
+          string_transmit_ln("----------------------------------");
+        }
+        else {
+          soil_block = false; 
+        }
+
+      if (!(night_block | soil_block)){ //
+        unsigned char send_data[2] = {0};
+        send_data[0] = MY_ADDRESS;
+        send_data[1] = (unsigned char)pwm2;
+        int now=0;
+        twi_master_transmit(send_data, 2);
+
+        string_transmit("Master: Send success!. send PWM power : ");
+        send_number(pwm2);
+        string_transmit("\n");
+        string_transmit_ln("----------------------------------");
+      }
+      else {
+        string_transmit_ln("Do not watering");
+        string_transmit_ln("----------------------------------");
+      }
+
+      TWAR = (MY_ADDRESS << 1);
+      TWCR = (1 << TWINT) | (1 << TWEA) | (1 << TWEN);
+  }
+
+    if(current_count - cycle_start_count == UPDATE_INTERVAL ){
+      if (!(night_block | soil_block)){
+        err = FC - hum_data;
+        string_transmit("error : ");
+        send_number(err);
+        string_transmit("\n");
+
+        const float K_DRY = 0.40f;   
+        const float K_WET = 0.80f;  
+        float k = (err > 0.0f) ? K_DRY : K_WET;
+        pwm += k * err;   
+
+        if (pwm < 0.0f)   pwm = 0.0f;
+        if (pwm > 254.0f) pwm = 254.0f;
+        string_transmit("NEXT PWM : ");
+        send_number(pwm);
+        string_transmit("\n");
+
+        night_block = true;
+        soil_block = true;
+
+        string_transmit_ln("----------------------------------");
+      }
+    }
+}
+
+  
