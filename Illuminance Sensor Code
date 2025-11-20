@@ -1,0 +1,273 @@
+#define F_CPU 16000000UL
+#define SCL_CLOCK 100000L
+
+#define MY_ADDRESS 0x28     // 내 주소
+#define TARGET_ADDRESS 0x25 // 보내는 곳의 주소
+
+volatile unsigned long timer2_overflow_count = 0;
+const unsigned long TRANSMIT_INTERVAL = 61 * 3; // 1000 / 16.384 ≈ 61. 주기는 3초.
+
+// UART 글로벌 변수 설정
+const int UBRR = 103;
+unsigned char str [100];
+
+// -----------------------------
+// Timer2 오버플로우 인터럽트 설정
+// -----------------------------
+void timer2_init(void) {
+    TCCR2A = 0; 
+    TCCR2B = (1 << CS22) | (1 << CS21) | (1 << CS20); // 프리스케일러 1024
+    TIMSK2 |= (1 << TOIE2); // 오버플로우 인터럽트 활성화
+}
+
+// -----------------------------
+// Timer2 오버플로우 ISR
+// (약 16.384ms마다 자동 호출됨)
+// -----------------------------
+ISR(TIMER2_OVF_vect) {
+    timer2_overflow_count++;
+}
+
+volatile uint8_t received_sender_id;     // 수신된 '보낸 주소'를 저장할 변수
+volatile bool expecting_sender_id = true; // '보낸 주소'를 기다리는 중인지 상태 플래그
+
+// LDR 센서 전후 비교 변수 선언 및 초기화
+int sensorValue;                // A0 핀의 값을 읽음 (0 ~ 1023)
+int previousSensorValue;        // A0 핀 이전 값 저장.
+
+// --- 마스터 역할 수행 함수 ---
+// 1바이트가 아닌, 여러 바이트(배열)를 전송하도록 수정됨
+bool twi_master_transmit(unsigned char* data, uint8_t length) {
+
+    // 1. START Condition 전송
+    TWCR = (1 << TWINT) | (1 << TWSTA) | (1 << TWEN);
+    while (!(TWCR & (1 << TWINT)));
+    if ((TWSR & 0xF8) != 0x08) return false; // START 실패
+
+    // 2. Target 주소와 쓰기 모드(W=0) 전송
+    TWDR = (TARGET_ADDRESS << 1) | 0;
+    TWCR = (1 << TWINT) | (1 << TWEN);
+    while (!(TWCR & (1 << TWINT)));
+
+    // 3. 주소 전송 후 상태 확인
+    switch (TWSR & 0xF8) {
+        case 0x18: // SLA+W 전송 성공, ACK 받음
+            break; // 계속 진행
+        case 0x20: // SLA+W 전송 성공, NACK 받음
+            TWCR = (1 << TWINT) | (1 << TWSTO) | (1 << TWEN); // STOP
+            return false;
+        case 0x38: // 중재 손실 (Arbitration Lost)
+            TWCR = (1 << TWINT) | (1 << TWEN);
+            return false;
+        default:
+            return false; // 기타 에러
+    }
+    
+    // 4. 데이터 바이트들을 순차적으로 전송 (수정된 부분)
+    for (uint8_t i = 0; i < length; i++) {
+        TWDR = data[i]; // 배열의 i번째 데이터 로드
+        TWCR = (1 << TWINT) | (1 << TWEN); // 전송 시작
+        while (!(TWCR & (1 << TWINT))); // 완료 대기
+
+        // 데이터 전송 실패(NACK) 시
+        if ((TWSR & 0xF8) != 0x28) {
+            TWCR = (1 << TWINT) | (1 << TWSTO) | (1 << TWEN); // STOP
+            return false;
+        }
+    }
+
+    // 5. 모든 데이터 전송 완료 후 STOP Condition 전송
+    TWCR = (1 << TWINT) | (1 << TWSTO) | (1 << TWEN);
+    return true; // 전송 성공
+}
+
+////레지스터 단위의 analog read 를 하는 함수
+uint16_t readADC(uint8_t channel) {
+  // 채널 선택 (A0 ~ A5 → 0~5)
+  ADMUX = (1 << REFS0) | (channel & 0x07);
+  // REFS0 = 1 → AVcc를 기준 전압으로 선택
+  // REFS1 = 0 → 외부 AREF 핀 사용 안 함
+
+  // ADC 활성화 + 프리스케일러 설정 (ADC Enable + Prescaler 128)
+  ADCSRA = (1 << ADEN) | (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0);
+  // 프리스케일러 128 → 16MHz / 128 = 125kHz (ADC 클럭 권장 범위)
+
+  // 변환 시작
+  ADCSRA |= (1 << ADSC);
+
+  // 변환 완료 대기
+  while (ADCSRA & (1 << ADSC));  // ADSC 비트가 0이 될 때까지 기다림
+
+  // 결과 읽기 (하위 바이트 먼저)
+  uint16_t result = ADCL;
+  result |= ((uint16_t)ADCH << 8);
+
+  return result;
+}
+
+void setup(){
+  Serial.begin(9600); // 디버깅용 시리얼
+  Serial.println("Multi-Slave Polling Master Initialized.");
+
+   // 풀업 저항 활성화 (모든 노드가 활성화해도 괜찮음)
+    PORTC |= (1 << PC4) | (1 << PC5);
+    
+    // SCL 주파수 설정 (100kHz)
+    TWSR = 0x00;
+    TWBR = ((F_CPU / SCL_CLOCK) - 16) / 2;
+    
+    // 자신의 슬레이브 주소 설정
+    TWAR = (MY_ADDRESS << 1);
+    
+    // TWI 활성화 및 ACK 응답 활성화 (슬레이브 대기 모드로 시작)
+    TWCR = (1 << TWEN) | (1 << TWEA);
+
+    timer2_init();
+    SREG|= (1<<7);
+
+    
+    Serial.print("Node initialized. My address is 0x");
+    Serial.println(MY_ADDRESS, HEX);
+}
+
+void loop(){
+
+  static unsigned long previous_overflow_count = 0;
+
+  int aboveValue;                 // 700 이하면 1.
+  int diffValue;                  // ADC 값의 차이가 클 때 1.
+  unsigned char scaledValue;      // 최종적으로 보내는 0(day) or 1(night) 값.
+  int a;                          // scaledValue 지정을 위한 임시변수.
+
+  int dayOrNight = 700;           // 밤인가 낮인가. aboveValue와 같이 쓰임.
+  int absNight = 500;             // 무조건 밤인 ADC값.
+  int absDay = 800;               // 무조건 낮인 ADC값.
+  int compareSensorValue = 300;   // previousSensorValue와 sensorValue의 차이가 심한 기준
+
+  // 실내등에 810 정도
+  // 손가락 대면 450 정도
+
+  if (timer2_overflow_count >= TRANSMIT_INTERVAL) {
+    
+    previousSensorValue = sensorValue;
+    sensorValue = readADC(0);
+    
+    
+    // (지금은) 700보다 위인지 확인.
+    if (sensorValue > dayOrNight) {
+      aboveValue = 0; // Day
+    }
+      else {
+        aboveValue = 1; //Night
+      }
+
+    // 조도 변화 감지
+    if (abs(sensorValue - previousSensorValue) > compareSensorValue) {
+      diffValue = 1;  // 차이가 큼.
+      }
+      else {
+        diffValue = 0;  // 차이가 작음.
+      }
+
+    // ADC가 200보다 낮거나, 변화폭and고정값이 1이거나. -> 무조건 밤.
+    if ( (sensorValue < absNight) || ( diffValue && aboveValue ) ) {
+      a = 1;
+      
+    }
+    else if ( (sensorValue > absDay) || ( diffValue && !aboveValue ) ) {
+      a = 0;
+      
+      }
+
+      scaledValue = a;
+    
+    // 시리얼 모니터에 전송할 데이터 출력
+    string_transmit("Master: Attempting to send [ID, Value] -> [0x");
+    send_number_hex(MY_ADDRESS);
+    string_transmit(", ");
+    send_number(scaledValue);
+    string_transmit("]\nLight Flux: ");
+    send_number(sensorValue);
+    string_transmit("\n");
+    
+    
+    // 2바이트 패킷 생성
+    unsigned char data_packet[2];
+    data_packet[0] = MY_ADDRESS;  // Byte 1: 보낸 사람 (나)의 주소
+    data_packet[1] = scaledValue; // Byte 2: 실제 데이터
+    if (scaledValue) {
+      string_transmit_ln("night");
+    } else {
+      string_transmit_ln("day");
+    }
+    
+    // 수정된 함수를 호출하여 2바이트 패킷 전송
+    if (twi_master_transmit(data_packet, 2)) {
+        string_transmit("Master: Send success!\n");
+    } else {
+        string_transmit("Master: Send failed (Bus busy, NACK, or Arbitration Lost).\n");
+    }
+    string_transmit("\n");
+    
+
+      TIMSK2 &= ~(1 << TOIE2); // 쓰기 전 인터럽트 비활성화
+    timer2_overflow_count = 0;
+    TIMSK2 |= (1 << TOIE2); // 쓰기 후 인터럽트 활성화
+
+    // 마스터 역할 후, 슬레이브 수신 상태로 복귀
+    TWAR = (MY_ADDRESS << 1);
+    TWCR = (1 << TWINT) | (1 << TWEA) | (1 << TWEN);
+  }
+}
+
+
+/// UART 설정 ///
+void UART_init(unsigned int ubrr) {
+  
+  //set baud rate
+  UBRR0H = (unsigned char)(ubrr >> 8);
+  UBRR0L = (unsigned char)ubrr;
+  
+  //ENABLE reciever and transmitter
+  UCSR0B = (1 << RXEN0) | (1 << TXEN0); //송신과 수신 모두 활성화
+
+  //set frame format: 8 data bits, 1stop bit
+  UCSR0C = (1 << UCSZ01) | (1 << UCSZ00); //UCSR0C레지스터는 통신 모드 (비동기/동기), 패리티 설정, 정지 비트 수, 데이터 비트 수 등 프레임 형식을 설정
+  //UCSZn2 UCSZn1 UCSZn0 011 = 8비트를 나타냄
+}
+
+void UART_transmit(unsigned char data) {
+  //Wait for empty transmit buffer
+  while (!(UCSR0A & (1 << UDRE0))); //UDRE0 비트가 1일 때까지 기다리고 1이면 buffer가 작성 준비가 완료 됨. 즉, 이 비트가 0이면 while문을 빠져나옴
+
+  //put data into buffer, sends the data
+  UDR0 = data; //UDR0는 USART I/O 레지스터
+}
+
+//단어 하나하나가 아닌 문자를 보기 위해 따로 함수로 표현
+void string_transmit_ln(const char data []) {
+  for (int i = 0; data[i] != '\0'; i ++) {
+    UART_transmit(data[i]);
+  }
+  UART_transmit('\n'); // 줄바꿈
+}
+
+void string_transmit(const char data []) {
+  for (int i = 0; data[i] != '\0'; i ++) {
+    UART_transmit(data[i]);
+  }
+}
+
+void send_number(uint16_t num) {
+  char buf[10];
+  itoa(num, buf, 10);  // 10진수 문자열로 변환
+  string_transmit(buf);
+}
+
+void send_number_hex(uint8_t num) {
+  char buf[4];
+  itoa(num, buf, 16);  // 16진수 문자열로 변환
+  string_transmit(buf);
+}
+
+
