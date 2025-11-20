@@ -1,0 +1,185 @@
+#define F_CPU 16000000UL
+#define SCL_CLOCK 100000L
+
+#define MAX_DATA   2      // 최대 수신 바이트 수
+#define NUM_SLAVES 1
+
+#define I2C_TIMEOUT 200
+#define TWI_ERROR_TIMEOUT 0xFF
+#define MY_ADDRESS 0x21
+
+volatile bool pwm_is_active = false;
+volatile uint8_t pwm_val = 0;
+
+volatile unsigned long timer2_overflow_count = 0;
+
+// 펌프가 켜졌다 꺼지는 시간의 오버플로우 횟수 (3초)
+const unsigned long PUMP_OFF_COUNT = 183;
+
+volatile uint8_t received_sender_id;     // 수신된 '보낸 주소'를 저장할 변수
+volatile bool expecting_sender_id = true; // '보낸 주소'를 기다리는 중인지 상태 플래그
+
+void setup(){
+  UART_init(103); // 디버깅용 시리얼
+  string_transmit_ln("Multi-Slave Polling Master Initialized.");
+
+  DDRD |= 0x60; // 워터펌프: 6번핀(PD6), 5번핀(PD5)
+  
+  // 워터펌프용 Timer0 설정
+  // Fast PWM, non-inverting output
+  TCCR0A = (1 << COM0A1) | (1 << COM0B1) | (1 << WGM01) | (1 << WGM00);
+  // Prescaler 64 (976Hz)
+  TCCR0B = (1 << CS01)|(1 << CS00);
+
+  OCR0A = 0; // 초기 워터펌프 PWM 0으로 시작
+  TCCR0A &= ~(1 << COM0A1); // OC0A(PD6) 핀 연결 해제 (꺼놓고 시작)
+
+  // 시간 측정용 Timer2 설정
+  TCCR2A = 0; 
+  TCCR2B = 0; // timer2 꺼둔 채로 시작
+  TIMSK2 |= (1 << TOIE2); // Overflow 인터럽트 활성화
+
+   // 풀업 저항 활성화 (모든 노드가 활성화해도 괜찮음)
+    PORTC |= (1 << PC4) | (1 << PC5);
+    
+    // SCL 주파수 설정 (100kHz)
+    TWSR = 0x00;
+    TWBR = ((F_CPU / SCL_CLOCK) - 16) / 2;
+    
+    // 자신의 슬레이브 주소 설정
+    TWAR = (MY_ADDRESS << 1);
+    
+    // TWI 활성화 및 ACK 응답 활성화 (슬레이브 대기 모드로 시작)
+    TWCR = (1 << TWEN) | (1 << TWEA);
+
+    string_transmit("Node initialized. My address is 0x");
+    send_hex(MY_ADDRESS);
+    string_transmit("\n");
+}
+
+// Timer2 ovf: 약 16.384ms 마다 자동으로 호출
+ISR(TIMER2_OVF_vect) {
+  if(pwm_is_active){
+    timer2_overflow_count++;
+    if (timer2_overflow_count >= PUMP_OFF_COUNT){ // 시간 지나면 여기서 끔
+      TCCR0A &= ~(1 << COM0A1); // 워터펌프 핀연결 해제
+      TCCR2B = 0; // 타이머2 분주비 0 -> 타이머 정지
+      pwm_is_active = false;
+    }
+  }
+}
+
+// --- 슬레이브 역할 수행 함수 ---
+void twi_slave_listen() {
+  unsigned char actual_data;
+    if (!(TWCR & (1 << TWINT))) {
+        return; // 이벤트 없음
+    }
+    
+    switch (TWSR & 0xF8) {
+        // 1. 자신의 주소(SLA+W)가 호출된 경우
+        case 0x60:
+            //Serial.println("Slave: Addressed.");
+            expecting_sender_id = true; // 상태 초기화: 첫 바이트는 '보낸 주소'일 것
+            TWCR = (1 << TWINT) | (1 << TWEA) | (1 << TWEN); // 데이터 수신 준비
+            break;
+
+        // 2. 데이터가 수신된 경우
+        case 0x80:
+            if (expecting_sender_id) {
+                // (1) 첫 번째 바이트 수신 -> '보낸 주소'로 저장
+                received_sender_id = TWDR;
+                expecting_sender_id = false; // 상태 변경: 다음 바이트는 '데이터'일 것
+            } else {
+                // (2) 두 번째 바이트 수신 -> '실제 데이터'
+                actual_data = TWDR;
+                
+                // "누가 보냈는지" 함께 출력
+                string_transmit("Slave: Received data -> ");
+                send_number(actual_data);
+                string_transmit(" (From: 0x");
+                send_hex(received_sender_id);
+                string_transmit_ln(")");
+                if (received_sender_id == 0x25){
+                  if (pwm_is_active == false){
+                    pwm_is_active = true;
+
+                    // --- 4바이트 변수를 안전하게 읽기 위한 처리 ---
+                    // Timer2 오버플로우 인터럽트를 잠시 비활성화하여 읽는 도중 값이 바뀌는 것을 방지
+                    TIMSK2 &= ~(1 << TOIE2);
+                    timer2_overflow_count = 0;
+                    // 다시 인터럽트 활성화
+                    TIMSK2 |= (1 << TOIE2);
+
+                    OCR0A = actual_data;
+                    TCCR0A |= (1 << COM0A1);
+                    TCNT2 = 0;
+                    TCCR2B = (1 << CS22) | (1 << CS21) | (1<<CS20);
+                }
+              }                  
+            }
+            TWCR = (1 << TWINT) | (1 << TWEA) | (1 << TWEN); // 다음 데이터 수신 준비
+            break;
+
+        // 3. STOP 신호가 수신된 경우
+        case 0xA0:
+            string_transmit_ln("Slave: Stop condition received.");
+            expecting_sender_id = true; // 다음 메시지를 위해 상태 초기화
+            TWCR = (1 << TWINT) | (1 << TWEA) | (1 << TWEN); // 다시 주소 수신 대기
+            break;
+            
+        default:
+            TWCR = (1 << TWINT) | (1 << TWEA) | (1 << TWEN);
+            break;
+    }
+}
+
+/// UART 설정 ///
+void UART_init(unsigned int ubrr) {
+  
+  //set baud rate
+  UBRR0H = (unsigned char)(ubrr >> 8);
+  UBRR0L = (unsigned char)ubrr;
+  
+  //ENABLE reciever and transmitter
+  UCSR0B = (1 << RXEN0) | (1 << TXEN0); //송신과 수신 모두 활성화
+
+
+  //set frame format: 8 data bits, 1stop bit
+  UCSR0C = (1 << UCSZ01) | (1 << UCSZ00); //UCSR0C레지스터는 통신 모드 (비동기/동기), 패리티 설정, 정지 비트 수, 데이터 비트 수 등 프레임 형식을 설정
+  //UCSZn2 UCSZn1 UCSZn0 011 = 8비트를 나타냄
+}
+void UART_transmit(unsigned char data) {
+  //Wait for empty transmit buffer
+  while (!(UCSR0A & (1 << UDRE0))); //UDRE0 비트가 1일 때까지 기다리고 1이면 buffer가 작성 준비가 완료 됨. 즉, 이 비트가 0이면 while문을 빠져나옴
+
+  //put data into buffer, sends the data
+  UDR0 = data; //UDR0는 USART I/O 레지스터
+}
+void string_transmit_ln(const char data []) {
+  for (int i = 0; data[i] != '\0'; i ++) {
+    UART_transmit(data[i]);
+  }
+  UART_transmit('\n'); // 줄바꿈
+}
+void string_transmit(const char data []) {
+  for (int i = 0; data[i] != '\0'; i ++) {
+    UART_transmit(data[i]);
+  }
+}
+void send_number(uint16_t num) {
+  char buf[10];
+  itoa(num, buf, 10);  // 10진수 문자열로 변환
+  string_transmit(buf);
+}
+void send_hex(uint8_t num) {
+  char buf[10];
+  // 값을 16진수(base 16) 문자열로 변환
+  itoa(num, buf, 16); 
+  string_transmit(buf);
+}
+/// UART 설정 끝 ///
+
+void loop(){
+  twi_slave_listen();
+}
